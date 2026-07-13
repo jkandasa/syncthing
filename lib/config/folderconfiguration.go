@@ -130,7 +130,10 @@ func (f FolderConfiguration) Filesystem(extraOpts ...fs.Option) fs.Filesystem {
 	if f.FilesystemType == FilesystemTypeBasic && f.JunctionsAsDirs {
 		opts = append(opts, new(fs.OptionJunctionsAsDirs))
 	}
-	if !f.CaseSensitiveFS {
+	// Case-conflict detection lists every directory (often twice). That is
+	// very expensive on S3/HDD object stores and is unnecessary when object
+	// keys are already case-sensitive and under our control.
+	if !f.CaseSensitiveFS && f.FilesystemType != FilesystemTypeS3 {
 		opts = append(opts, new(fs.OptionDetectCaseConflicts))
 	}
 	opts = append(opts, extraOpts...)

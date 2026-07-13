@@ -20,7 +20,6 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,6 +79,9 @@ type S3Filesystem struct {
 	prefix  string // optional key prefix inside the bucket (always ends with "/" or is "")
 	uri     string
 	options []fs.Option
+	// tree caches one recursive ListObjects of the folder prefix so scans
+	// do not issue a ListObjects call per directory (costly on HDD backends).
+	tree treeCache
 }
 
 // NewS3Filesystem creates a new S3-backed filesystem from a URI of the form:
@@ -306,48 +308,28 @@ func (f *S3Filesystem) CreateSymlink(target, name string) error {
 	_, err = f.client.PutObject(context.Background(), f.bucket, k, strings.NewReader(target), int64(len(target)), minio.PutObjectOptions{
 		UserMetadata: meta,
 	})
+	f.tree.invalidate()
 	return err
 }
 
 func (f *S3Filesystem) DirNames(name string) ([]string, error) {
-	k, err := f.key(name)
-	if err != nil {
+	if _, err := f.key(name); err != nil {
 		return nil, err
 	}
-	prefix := k
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
+
+	// Prefer a single recursive listing of the folder prefix (paginated by
+	// the SDK) over one ListObjects per directory. On HDD-backed MinIO this
+	// is typically orders of magnitude cheaper during a full scan.
+	if err := f.ensureTree(context.Background()); err != nil {
+		return nil, err
+	}
+	if names, ok := f.cachedDirNames(name); ok {
+		return names, nil
 	}
 
-	ctx := context.Background()
-	var names []string
-	seen := make(map[string]bool)
-
-	for obj := range f.client.ListObjects(ctx, f.bucket, minio.ListObjectsOptions{
-		Prefix:    prefix,
-		Recursive: false,
-	}) {
-		if obj.Err != nil {
-			return nil, obj.Err
-		}
-		rel := strings.TrimPrefix(obj.Key, prefix)
-		rel = strings.TrimSuffix(rel, "/")
-		// Skip empty names and dir markers
-		if rel == "" || rel == ".syncthing_dir_marker" || strings.HasSuffix(rel, "/.syncthing_dir_marker") {
-			continue
-		}
-		// Only take the first path component
-		if idx := strings.Index(rel, "/"); idx >= 0 {
-			rel = rel[:idx]
-		}
-		if !seen[rel] {
-			seen[rel] = true
-			names = append(names, rel)
-		}
-	}
-
-	sort.Strings(names)
-	return names, nil
+	// Directory missing in cache → empty or not found; match previous
+	// behavior of listing an empty prefix (empty result, not error).
+	return []string{}, nil
 }
 
 func (f *S3Filesystem) Lstat(name string) (fs.FileInfo, error) {
@@ -371,6 +353,7 @@ func (f *S3Filesystem) Mkdir(name string, perm fs.FileMode) error {
 	_, err = f.client.PutObject(context.Background(), f.bucket, markerKey, bytes.NewReader(nil), 0, minio.PutObjectOptions{
 		UserMetadata: meta,
 	})
+	f.tree.invalidate()
 	return err
 }
 
@@ -396,6 +379,7 @@ func (f *S3Filesystem) MkdirAll(name string, perm fs.FileMode) error {
 			}
 		}
 	}
+	f.tree.invalidate()
 	return nil
 }
 
@@ -487,10 +471,13 @@ func (f *S3Filesystem) Remove(name string) error {
 	err = f.client.RemoveObject(context.Background(), f.bucket, k, minio.RemoveObjectOptions{})
 	if err != nil {
 		// Try as directory marker
-		return f.client.RemoveObject(context.Background(), f.bucket, k+dirMarker, minio.RemoveObjectOptions{})
+		err = f.client.RemoveObject(context.Background(), f.bucket, k+dirMarker, minio.RemoveObjectOptions{})
+		f.tree.invalidate()
+		return err
 	}
 	// Also try removing the dir marker if any
 	_ = f.client.RemoveObject(context.Background(), f.bucket, k+dirMarker, minio.RemoveObjectOptions{})
+	f.tree.invalidate()
 	return nil
 }
 
@@ -525,6 +512,7 @@ func (f *S3Filesystem) RemoveAll(name string) error {
 			return err
 		}
 	}
+	f.tree.invalidate()
 	return nil
 }
 
@@ -552,7 +540,9 @@ func (f *S3Filesystem) Rename(oldname, newname string) error {
 		return err
 	}
 
-	return f.client.RemoveObject(ctx, f.bucket, oldKey, minio.RemoveObjectOptions{})
+	err = f.client.RemoveObject(ctx, f.bucket, oldKey, minio.RemoveObjectOptions{})
+	f.tree.invalidate()
+	return err
 }
 
 func (f *S3Filesystem) Stat(name string) (fs.FileInfo, error) {
@@ -560,6 +550,22 @@ func (f *S3Filesystem) Stat(name string) (fs.FileInfo, error) {
 }
 
 func (f *S3Filesystem) stat(name string) (fs.FileInfo, error) {
+	if _, err := f.key(name); err != nil {
+		return nil, err
+	}
+
+	// Serve from tree cache when warm (scan path). Avoids HeadObject per file
+	// and ListObjects for directory existence checks.
+	if err := f.ensureTree(context.Background()); err == nil {
+		if fi, ok := f.cachedStat(name); ok {
+			return fi, nil
+		}
+		// Cache is authoritative while valid: missing means not found.
+		if f.treeHasLoaded() {
+			return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
+		}
+	}
+
 	k, err := f.key(name)
 	if err != nil {
 		return nil, err
@@ -580,6 +586,12 @@ func (f *S3Filesystem) stat(name string) (fs.FileInfo, error) {
 
 	// Try as directory (look for dir marker or any child objects).
 	return f.statDir(name, k)
+}
+
+func (f *S3Filesystem) treeHasLoaded() bool {
+	f.tree.mu.Lock()
+	defer f.tree.mu.Unlock()
+	return f.tree.validLocked()
 }
 
 func (f *S3Filesystem) statDir(name, k string) (fs.FileInfo, error) {
@@ -790,6 +802,8 @@ func (f *S3Filesystem) updateMeta(key string, fn func(map[string]string)) error 
 		ReplaceMetadata: true,
 	}
 	_, err = f.client.CopyObject(ctx, dst, src)
+	// Metadata (mode/mtime) may change what scanners care about.
+	f.tree.invalidate()
 	return err
 }
 
@@ -1017,6 +1031,7 @@ func (f *s3File) flush() error {
 	_, err := f.fs.client.PutObject(context.Background(), f.fs.bucket, f.key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
 		UserMetadata: meta,
 	})
+	f.fs.tree.invalidate()
 	return err
 }
 

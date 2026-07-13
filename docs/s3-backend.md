@@ -289,6 +289,23 @@ Required IAM permissions:
 </folder>
 ```
 
+## Performance notes (HDD-backed MinIO)
+
+Full folder scans used to issue **one `ListObjects` per directory** (and more with
+case-conflict detection). On HDD backends that is very expensive.
+
+The S3 backend now:
+
+1. **Skips case-conflict detection** for `filesystemType=s3` (object keys are
+   case-sensitive; listing every directory twice is not worth it).
+2. **Caches one recursive listing** of the folder prefix for a short TTL (2
+   minutes) and serves `DirNames` / `Lstat` from that tree during a scan.
+   Mutations (write/delete/rename/mkdir) invalidate the cache immediately.
+
+Expected API shape during a scan: a **small number of paginated
+`ListObjectsV2` calls** for the whole prefix, instead of hundreds of per-directory
+lists. `HeadObject` is largely avoided for walk/stat when the cache is warm.
+
 ## Limitations
 
 1. **No filesystem watching** — S3 does not support inotify-style notifications, so `fsWatcherEnabled` should be set to `false`. Use periodic rescans instead.
@@ -297,6 +314,7 @@ Required IAM permissions:
 4. **Eventual consistency** — depending on the S3 provider, recently written objects may not be immediately visible.
 5. **No hard links** — S3 objects are independent; hard links are not supported.
 6. **Symlinks stored as content** — symbolic links are emulated by storing the target path as the object's content, with the symlink mode bit set in metadata.
+7. **Cached `Lstat` metadata** — while the list cache is warm, file mode/ownership come from defaults (size/mtime from the listing). Full user-metadata is applied on open/read paths that `Head`/`Get` the object.
 
 ## Verification
 
