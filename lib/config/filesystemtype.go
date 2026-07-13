@@ -13,6 +13,7 @@ type FilesystemType string
 const (
 	FilesystemTypeBasic FilesystemType = "basic"
 	FilesystemTypeFake  FilesystemType = "fake"
+	FilesystemTypeS3    FilesystemType = "s3"
 )
 
 func (t FilesystemType) ToFS() fs.FilesystemType {
