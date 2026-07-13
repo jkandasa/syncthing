@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -747,6 +748,10 @@ func TestNewS3FilesystemFromURI(t *testing.T) {
 	if sfs.prefix != "myprefix/" {
 		t.Errorf("prefix = %q, want %q", sfs.prefix, "myprefix/")
 	}
+	// Secrets must not be stored in the URI field.
+	if strings.Contains(sfs.URI(), "AK") || strings.Contains(sfs.URI(), "SK") {
+		t.Errorf("URI still contains credentials: %q", sfs.URI())
+	}
 }
 
 func TestNewS3FilesystemFromURINoBucket(t *testing.T) {
@@ -754,6 +759,54 @@ func TestNewS3FilesystemFromURINoBucket(t *testing.T) {
 	_, err := NewS3Filesystem(uri)
 	if err == nil {
 		t.Error("expected error for URI without bucket name")
+	}
+}
+
+func TestNewS3FilesystemCredentialsFromEnv(t *testing.T) {
+	t.Setenv("S3_ACCESS_KEY_ID", "env-ak")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "env-sk")
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("MINIO_ACCESS_KEY", "")
+	t.Setenv("MINIO_SECRET_KEY", "")
+	t.Setenv("MINIO_ROOT_USER", "")
+	t.Setenv("MINIO_ROOT_PASSWORD", "")
+
+	sfs, err := NewS3Filesystem("s3://localhost:9000/envbucket")
+	if err != nil {
+		t.Fatalf("NewS3Filesystem with env credentials: %v", err)
+	}
+	if sfs.bucket != "envbucket" {
+		t.Errorf("bucket = %q, want envbucket", sfs.bucket)
+	}
+}
+
+func TestNewS3FilesystemURIOverridesEnv(t *testing.T) {
+	t.Setenv("S3_ACCESS_KEY_ID", "env-ak")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "env-sk")
+
+	// URI credentials win; construction must succeed even if we only check parsing.
+	sfs, err := NewS3Filesystem("s3://localhost:9000/b?accessKey=uri-ak&secretKey=uri-sk")
+	if err != nil {
+		t.Fatalf("NewS3Filesystem: %v", err)
+	}
+	if sfs.bucket != "b" {
+		t.Errorf("bucket = %q, want b", sfs.bucket)
+	}
+}
+
+func TestNewS3FilesystemMissingCredentials(t *testing.T) {
+	for _, key := range []string{
+		"S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY",
+		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+		"MINIO_ACCESS_KEY", "MINIO_SECRET_KEY",
+		"MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
+	} {
+		t.Setenv(key, "")
+	}
+	_, err := NewS3Filesystem("s3://localhost:9000/b")
+	if err == nil {
+		t.Fatal("expected error when credentials are missing from URI and env")
 	}
 }
 

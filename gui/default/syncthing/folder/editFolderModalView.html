@@ -73,9 +73,21 @@
               <span translate ng-show="!editingFolderExisting()">When adding a new folder, keep in mind that the Folder ID is used to tie folders together between devices. They are case sensitive and must match exactly between all devices.</span>
             </p>
           </div>
-          <div class="form-group" ng-class="{'has-error': folderEditor.folderPath.$invalid && folderEditor.folderPath.$dirty && !editingFolderDefaults()}">
+          <div class="form-group">
+            <label translate for="filesystemType">Filesystem Type</label>
+            <select class="form-control" id="filesystemType" name="filesystemType" ng-model="currentFolder.filesystemType" ng-change="setDefaultsForFilesystemType()">
+              <option value="basic" translate>Local Folder</option>
+              <option value="s3" translate>S3 / Object Storage</option>
+            </select>
+            <p class="help-block">
+              <span ng-if="currentFolder.filesystemType !== 's3'" translate>Store files on the local disk.</span>
+              <span ng-if="currentFolder.filesystemType === 's3'" translate>Store files in an S3-compatible bucket (MinIO, AWS S3, etc.).</span>
+            </p>
+          </div>
+
+          <div class="form-group" ng-if="currentFolder.filesystemType !== 's3'" ng-class="{'has-error': folderEditor.folderPath.$invalid && folderEditor.folderPath.$dirty && !editingFolderDefaults()}">
             <label translate for="folderPath">Folder Path</label>
-            <input name="folderPath" ng-readonly="editingFolderExisting()" id="folderPath" class="form-control" type="text" ng-model="currentFolder.path" list="directory-list" ng-required="!editingFolderDefaults()" ng-aria-required="!editingFolderDefaults()" path-is-sub-dir />
+            <input name="folderPath" ng-readonly="editingFolderExisting()" id="folderPath" class="form-control" type="text" ng-model="currentFolder.path" list="directory-list" ng-required="currentFolder.filesystemType !== 's3' && !editingFolderDefaults()" ng-aria-required="currentFolder.filesystemType !== 's3' && !editingFolderDefaults()" path-is-sub-dir />
             <datalist id="directory-list">
               <option ng-repeat="directory in directoryList" value="{{ directory }}" />
             </datalist>
@@ -89,6 +101,55 @@
                 <span class="text-danger" translate translate-value-other-folder="{{folderPathErrors.otherID}}" translate-value-other-folder-label="{{folderPathErrors.otherLabel}}" ng-if="folderPathErrors.otherLabel.length != 0">Warning, this path is a parent directory of an existing folder "{%otherFolderLabel%}" ({%otherFolder%}).</span>
               </span>
             </p>
+          </div>
+
+          <div ng-if="currentFolder.filesystemType === 's3'">
+            <div class="form-group" ng-class="{'has-error': folderEditor.s3Endpoint.$invalid && folderEditor.s3Endpoint.$dirty}">
+              <label translate for="s3Endpoint">S3 Endpoint</label>
+              <input name="s3Endpoint" id="s3Endpoint" class="form-control" type="text" ng-model="currentFolder._guiS3.endpoint" required aria-required="true" placeholder="minio:9000 or s3.us-east-1.amazonaws.com" />
+              <p class="help-block">
+                <span translate>Hostname and port of the S3 API (no scheme). Example: minio:9000 or s3.amazonaws.com</span>
+                <span translate ng-if="folderEditor.s3Endpoint.$error.required && folderEditor.s3Endpoint.$dirty">The S3 endpoint cannot be blank.</span>
+              </p>
+            </div>
+            <div class="form-group" ng-class="{'has-error': folderEditor.s3Bucket.$invalid && folderEditor.s3Bucket.$dirty}">
+              <label translate for="s3Bucket">S3 Bucket</label>
+              <input name="s3Bucket" id="s3Bucket" class="form-control" type="text" ng-model="currentFolder._guiS3.bucket" required aria-required="true" placeholder="syncthing" />
+              <p class="help-block">
+                <span translate>Bucket name where folder data will be stored.</span>
+                <span translate ng-if="folderEditor.s3Bucket.$error.required && folderEditor.s3Bucket.$dirty">The S3 bucket cannot be blank.</span>
+              </p>
+            </div>
+            <div class="form-group">
+              <label translate for="s3Prefix">S3 Prefix (optional)</label>
+              <input name="s3Prefix" id="s3Prefix" class="form-control" type="text" ng-model="currentFolder._guiS3.prefix" placeholder="path/inside/bucket" />
+              <p class="help-block" translate>Optional key prefix inside the bucket to scope this folder.</p>
+            </div>
+            <div class="row">
+              <div class="col-md-6 form-group">
+                <label translate for="s3AccessKey">Access Key (optional)</label>
+                <input name="s3AccessKey" id="s3AccessKey" class="form-control" type="text" ng-model="currentFolder._guiS3.accessKey" autocomplete="off" />
+              </div>
+              <div class="col-md-6 form-group">
+                <label translate for="s3SecretKey">Secret Key (optional)</label>
+                <input name="s3SecretKey" id="s3SecretKey" class="form-control" type="password" ng-model="currentFolder._guiS3.secretKey" autocomplete="new-password" />
+              </div>
+            </div>
+            <p class="help-block">
+              <span translate>Leave access and secret keys empty to use environment variables (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY, or AWS_* / MINIO_*). For default MinIO, use minioadmin / minioadmin.</span>
+            </p>
+            <div class="form-group">
+              <label>
+                <input type="checkbox" ng-model="currentFolder._guiS3.useSSL" />
+                &nbsp;<span translate>Use HTTPS (TLS)</span>
+              </label>
+              <p class="help-block" translate>Enable for AWS S3 and other TLS endpoints. Leave off for plain HTTP MinIO on a private network.</p>
+            </div>
+            <div class="form-group" ng-if="s3URIPreview()">
+              <label translate>Folder Path (URI)</label>
+              <input class="form-control" type="text" readonly ng-value="s3URIPreview()" />
+              <p class="help-block" translate>This URI is stored as the folder path. Secrets are included only if you entered them above.</p>
+            </div>
           </div>
         </div>
 
@@ -249,11 +310,12 @@
               <div class="row">
                 <div class="col-md-6">
                   <label>
-                    <input type="checkbox" ng-model="currentFolder.fsWatcherEnabled" ng-change="setFSWatcherIntervalDefault()">&nbsp;<span translate>Watch for Changes</span>
+                    <input type="checkbox" ng-model="currentFolder.fsWatcherEnabled" ng-change="setFSWatcherIntervalDefault()" ng-disabled="currentFolder.filesystemType === 's3'">&nbsp;<span translate>Watch for Changes</span>
                   </label>
                   <p class="help-block">
-                    <span translate>Use notifications from the filesystem to detect changed items.</span>
-                    <span translate>Watching for changes discovers most changes without periodic scanning.</span>
+                    <span translate ng-if="currentFolder.filesystemType !== 's3'">Use notifications from the filesystem to detect changed items.</span>
+                    <span translate ng-if="currentFolder.filesystemType !== 's3'">Watching for changes discovers most changes without periodic scanning.</span>
+                    <span translate ng-if="currentFolder.filesystemType === 's3'">Not available for S3-backed folders. Use a shorter full rescan interval instead.</span>
                   </p>
                 </div>
                 <div class="col-md-6">

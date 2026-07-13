@@ -426,6 +426,7 @@
                           <th><span class="fas fa-fw fa-folder-open"></span>&nbsp;<span translate>Folder Path</span></th>
                           <td class="text-right">
                             <span tooltip data-original-title="{{folder.path}}">{{folder.path}}</span>
+                            <span ng-if="folder.filesystemType === 's3'" class="text-muted"> · <span translate>S3</span></span>
                           </td>
                         </tr>
                         <tr ng-if="!folder.paused && (model[folder.id].invalid || model[folder.id].error)">

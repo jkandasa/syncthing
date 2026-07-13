@@ -33,10 +33,10 @@ This metadata is set on every `PutObject` call and updated via server-side copy 
 
 ### URI Format
 
-The S3 backend uses a URI-based configuration:
+The S3 backend uses a URI-based configuration for endpoint and bucket:
 
 ```
-s3://ENDPOINT/BUCKET[/PREFIX]?accessKey=ACCESS_KEY&secretKey=SECRET_KEY[&useSSL=true]
+s3://ENDPOINT/BUCKET[/PREFIX][?accessKey=ACCESS_KEY&secretKey=SECRET_KEY&useSSL=true]
 ```
 
 | Parameter   | Description                                                    |
@@ -44,42 +44,122 @@ s3://ENDPOINT/BUCKET[/PREFIX]?accessKey=ACCESS_KEY&secretKey=SECRET_KEY[&useSSL=
 | `ENDPOINT`  | S3 endpoint hostname and port (e.g. `s3.amazonaws.com`, `localhost:9000`) |
 | `BUCKET`    | S3 bucket name                                                 |
 | `PREFIX`    | Optional key prefix to scope all objects under a subdirectory  |
-| `accessKey` | S3 access key ID                                               |
-| `secretKey` | S3 secret access key                                           |
-| `useSSL`    | Set to `true` to use HTTPS (default: `false`)                  |
+| `accessKey` | S3 access key ID (optional if set via environment)             |
+| `secretKey` | S3 secret access key (optional if set via environment)         |
+| `useSSL`    | Set to `true` to use HTTPS (default: `false`, or `S3_USE_SSL`) |
+
+### Credentials via environment (recommended)
+
+Prefer **not** putting secrets in `config.xml`. Omit `accessKey` / `secretKey`
+from the URI and set environment variables on the Syncthing process instead.
+
+| Purpose        | Environment variables (first non-empty wins) |
+|----------------|-----------------------------------------------|
+| Access key     | `S3_ACCESS_KEY_ID`, `AWS_ACCESS_KEY_ID`, `MINIO_ACCESS_KEY`, `MINIO_ROOT_USER` |
+| Secret key     | `S3_SECRET_ACCESS_KEY`, `AWS_SECRET_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_ROOT_PASSWORD` |
+| Session token  | `S3_SESSION_TOKEN`, `AWS_SESSION_TOKEN` (optional) |
+| Use TLS        | `S3_USE_SSL=true` (if `useSSL` is not in the URI) |
+
+URI query parameters override the environment when both are set.
+
+Examples below use MinIO’s **default** credentials:
+
+- access key: `minioadmin`
+- secret key: `minioadmin`
+
+**Docker Compose example:**
+
+```yaml
+services:
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  syncthing:
+    image: quay.io/jkandasa/syncthing:s3
+    environment:
+      # Same as MinIO defaults (minioadmin / minioadmin)
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    # folder path can be just: s3://minio:9000/syncthing
+```
 
 ### Example URIs
 
-**Local MinIO:**
+**Local MinIO (credentials from env — recommended):**
+```
+s3://minio:9000/my-syncthing-bucket
+```
+
+**Local MinIO (credentials in URI — less secure; default MinIO user/password):**
 ```
 s3://localhost:9000/my-syncthing-bucket?accessKey=minioadmin&secretKey=minioadmin
 ```
 
-**AWS S3:**
+**AWS S3 (credentials from env, TLS on):**
 ```
-s3://s3.us-east-1.amazonaws.com/my-syncthing-bucket?accessKey=AKIA...&secretKey=...&useSSL=true
+s3://s3.us-east-1.amazonaws.com/my-syncthing-bucket?useSSL=true
 ```
 
 **With prefix (scope files under a subdirectory):**
 ```
-s3://localhost:9000/my-bucket/syncthing-data?accessKey=minioadmin&secretKey=minioadmin
+s3://localhost:9000/my-bucket/syncthing-data
 ```
 
 ### Syncthing Configuration
 
-In your `config.xml`, set `filesystemType` to `s3` and `path` to the S3 URI:
+In your `config.xml`, set the folder `path` to the S3 URI and add a
+**child element** `<filesystemType>s3</filesystemType>` (not an attribute —
+attributes are ignored and the folder stays on the default `basic` filesystem).
 
 ```xml
-<folder id="my-s3-folder" label="S3 Backed Folder" filesystemType="s3"
-  path="s3://localhost:9000/my-bucket?accessKey=minioadmin&amp;secretKey=minioadmin">
+<folder id="my-s3-folder" label="S3 Backed Folder"
+  path="s3://minio:9000/my-bucket"
+  type="sendreceive" rescanIntervalS="60" fsWatcherEnabled="false">
+    <filesystemType>s3</filesystemType>
     <device id="DEVICE-ID-HERE" />
-    <!-- Note: use &amp; for & in XML -->
 </folder>
 ```
 
-You can also configure this through the REST API or GUI by selecting the "S3" filesystem type and providing the S3 URI as the folder path.
+Set credentials on the process (Docker `environment`, systemd `Environment=`, etc.).
+For a stock MinIO server these are the defaults:
 
-> **Important:** In XML, ampersands (`&`) in the URI must be escaped as `&amp;`.
+```bash
+export S3_ACCESS_KEY_ID=minioadmin
+export S3_SECRET_ACCESS_KEY=minioadmin
+```
+
+### GUI configuration
+
+In **Add Folder** / **Edit Folder** → **General**:
+
+1. Set **Filesystem Type** to **S3 / Object Storage**.
+2. Fill **S3 Endpoint** (e.g. `minio:9000` or `localhost:9000`), **S3 Bucket**, optional **Prefix**.
+3. Optionally enter **Access Key** / **Secret Key** as `minioadmin` / `minioadmin`
+   (MinIO defaults), or leave them empty and set the same values via environment
+   variables on the Syncthing process.
+4. Enable **Use HTTPS (TLS)** for AWS and other TLS endpoints (leave off for local HTTP MinIO).
+5. Save. Syncthing stores `filesystemType=s3` and a composed `s3://…` path.
+
+**Watch for Changes** is disabled for S3 folders; use **Full Rescan Interval** instead.
+
+You can still edit `config.xml` or the REST API directly:
+
+```bash
+# Example: update an existing folder (credentials stay in the environment)
+curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8384/rest/config/folders/my-s3-folder \
+  | jq '.filesystemType = "s3" | .path = "s3://minio:9000/my-bucket" | .fsWatcherEnabled = false' \
+  | curl -s -X PUT -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+      --data-binary @- http://127.0.0.1:8384/rest/config/folders/my-s3-folder
+```
+
+> **Important:** If you put credentials in the URI in XML, ampersands (`&`) must be escaped as `&amp;`.
 
 ## Setup Guide
 
@@ -128,15 +208,29 @@ mc mb local/syncthing-data
 
 #### Step 4: Configure Syncthing
 
+Export MinIO’s default credentials for the Syncthing process:
+
+```bash
+export S3_ACCESS_KEY_ID=minioadmin
+export S3_SECRET_ACCESS_KEY=minioadmin
+```
+
 Add the S3-backed folder to your Syncthing configuration (`~/.config/syncthing/config.xml`):
 
 ```xml
-<folder id="s3-folder" label="My S3 Folder" filesystemType="s3"
-  path="s3://localhost:9000/syncthing-data?accessKey=minioadmin&amp;secretKey=minioadmin"
+<folder id="s3-folder" label="My S3 Folder"
+  path="s3://localhost:9000/syncthing-data"
   type="sendreceive" rescanIntervalS="60" fsWatcherEnabled="false">
+    <filesystemType>s3</filesystemType>
     <device id="YOUR-DEVICE-ID" />
     <minDiskFree unit="%">1</minDiskFree>
 </folder>
+```
+
+Or put the same default credentials in the URI (less secure):
+
+```
+s3://localhost:9000/syncthing-data?accessKey=minioadmin&secretKey=minioadmin
 ```
 
 > **Note:** File system watching (`fsWatcherEnabled`) is not supported with S3. Set it to `false` and rely on periodic rescans by setting `rescanIntervalS` appropriately.
@@ -187,9 +281,10 @@ Required IAM permissions:
 #### Step 3: Configure Syncthing
 
 ```xml
-<folder id="aws-folder" label="AWS S3 Folder" filesystemType="s3"
+<folder id="aws-folder" label="AWS S3 Folder"
   path="s3://s3.us-east-1.amazonaws.com/my-syncthing-bucket?accessKey=AKIAIOSFODNN7EXAMPLE&amp;secretKey=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY&amp;useSSL=true"
   type="sendreceive" rescanIntervalS="300" fsWatcherEnabled="false">
+    <filesystemType>s3</filesystemType>
     <device id="YOUR-DEVICE-ID" />
 </folder>
 ```

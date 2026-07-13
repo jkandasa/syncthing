@@ -32,6 +32,16 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
+// Credential / TLS settings can come from the URI query string or from the
+// process environment. Query parameters win when present.
+//
+// Environment variables (first non-empty wins for each field):
+//
+//	Access key:  S3_ACCESS_KEY_ID, AWS_ACCESS_KEY_ID, MINIO_ACCESS_KEY, MINIO_ROOT_USER
+//	Secret key:  S3_SECRET_ACCESS_KEY, AWS_SECRET_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_ROOT_PASSWORD
+//	Session:     S3_SESSION_TOKEN, AWS_SESSION_TOKEN  (optional)
+//	Use SSL:     S3_USE_SSL=true|1  (only if useSSL is not set in the URI)
+
 const FilesystemTypeS3 fs.FilesystemType = "s3"
 
 // S3 object metadata key prefix used to store POSIX attributes.
@@ -60,7 +70,10 @@ func init() {
 //
 // URI format:
 //
-//	s3://endpoint/bucket/prefix?accessKey=AK&secretKey=SK&useSSL=true
+//	s3://endpoint/bucket[/prefix][?accessKey=AK&secretKey=SK&useSSL=true]
+//
+// Credentials may be omitted from the URI and supplied via environment
+// variables instead (see package comment above).
 type S3Filesystem struct {
 	client  *minio.Client
 	bucket  string
@@ -71,7 +84,10 @@ type S3Filesystem struct {
 
 // NewS3Filesystem creates a new S3-backed filesystem from a URI of the form:
 //
-//	s3://endpoint/bucket[/prefix]?accessKey=AK&secretKey=SK[&useSSL=true]
+//	s3://endpoint/bucket[/prefix][?accessKey=AK&secretKey=SK&useSSL=true]
+//
+// If accessKey/secretKey are not in the query string, they are read from the
+// environment (S3_*, AWS_*, or MINIO_* variables).
 func NewS3Filesystem(uri string, opts ...fs.Option) (*S3Filesystem, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -89,13 +105,13 @@ func NewS3Filesystem(uri string, opts ...fs.Option) (*S3Filesystem, error) {
 		prefix = strings.TrimSuffix(pathParts[1], "/") + "/"
 	}
 
-	q := u.Query()
-	accessKey := q.Get("accessKey")
-	secretKey := q.Get("secretKey")
-	useSSL := q.Get("useSSL") == "true"
+	accessKey, secretKey, sessionToken, useSSL, err := resolveS3Credentials(u.Query())
+	if err != nil {
+		return nil, err
+	}
 
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, sessionToken),
 		Secure: useSSL,
 	})
 	if err != nil {
@@ -106,9 +122,77 @@ func NewS3Filesystem(uri string, opts ...fs.Option) (*S3Filesystem, error) {
 		client:  client,
 		bucket:  bucket,
 		prefix:  prefix,
-		uri:     uri,
+		uri:     redactS3URI(uri),
 		options: opts,
 	}, nil
+}
+
+// resolveS3Credentials returns access key, secret, optional session token, and
+// whether to use TLS. Query parameters override environment variables.
+func resolveS3Credentials(q url.Values) (accessKey, secretKey, sessionToken string, useSSL bool, err error) {
+	accessKey = firstNonEmpty(
+		q.Get("accessKey"),
+		os.Getenv("S3_ACCESS_KEY_ID"),
+		os.Getenv("AWS_ACCESS_KEY_ID"),
+		os.Getenv("MINIO_ACCESS_KEY"),
+		os.Getenv("MINIO_ROOT_USER"),
+	)
+	secretKey = firstNonEmpty(
+		q.Get("secretKey"),
+		os.Getenv("S3_SECRET_ACCESS_KEY"),
+		os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		os.Getenv("MINIO_SECRET_KEY"),
+		os.Getenv("MINIO_ROOT_PASSWORD"),
+	)
+	sessionToken = firstNonEmpty(
+		q.Get("sessionToken"),
+		os.Getenv("S3_SESSION_TOKEN"),
+		os.Getenv("AWS_SESSION_TOKEN"),
+	)
+
+	if _, ok := q["useSSL"]; ok {
+		useSSL = q.Get("useSSL") == "true"
+	} else {
+		switch strings.ToLower(os.Getenv("S3_USE_SSL")) {
+		case "1", "true", "yes":
+			useSSL = true
+		}
+	}
+
+	if accessKey == "" || secretKey == "" {
+		return "", "", "", false, fmt.Errorf("s3fs: credentials missing: set accessKey/secretKey in the folder URI, or set S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY (or AWS_* / MINIO_*) in the environment")
+	}
+	return accessKey, secretKey, sessionToken, useSSL, nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// redactS3URI removes secrets from a URI so it is safe to log or show in the UI.
+func redactS3URI(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	q := u.Query()
+	changed := false
+	for _, key := range []string{"accessKey", "secretKey", "sessionToken"} {
+		if q.Has(key) {
+			q.Set(key, "***")
+			changed = true
+		}
+	}
+	if !changed {
+		return uri
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // NewS3FilesystemFromClient creates an S3-backed filesystem with an externally provided

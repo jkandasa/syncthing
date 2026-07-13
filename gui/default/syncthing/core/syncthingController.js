@@ -914,8 +914,108 @@ angular.module('syncthing.core')
         }
 
         function shouldSetDefaultFolderPath() {
-            return $scope.config.defaults.folder.path && $scope.folderEditor.folderPath.$pristine && $scope.editingFolderNew();
+            if ($scope.currentFolder && $scope.currentFolder.filesystemType === 's3') {
+                return false;
+            }
+            return $scope.config.defaults.folder.path && $scope.folderEditor.folderPath && $scope.folderEditor.folderPath.$pristine && $scope.editingFolderNew();
         }
+
+        function emptyGuiS3() {
+            return {
+                endpoint: '',
+                bucket: '',
+                prefix: '',
+                accessKey: '',
+                secretKey: '',
+                useSSL: false,
+            };
+        }
+
+        function parseS3URI(uri) {
+            var result = emptyGuiS3();
+            if (!uri || uri.indexOf('s3://') !== 0) {
+                return result;
+            }
+            try {
+                // URL() needs an http(s) scheme; s3:// is otherwise identical.
+                var u = new URL(uri.replace(/^s3:/i, 'http:'));
+                result.endpoint = u.host;
+                var parts = u.pathname.replace(/^\//, '').split('/').filter(function (p) { return p.length > 0; });
+                result.bucket = parts[0] || '';
+                result.prefix = parts.slice(1).join('/');
+                result.accessKey = u.searchParams.get('accessKey') || '';
+                result.secretKey = u.searchParams.get('secretKey') || '';
+                result.useSSL = u.searchParams.get('useSSL') === 'true';
+            } catch (e) {
+                // leave defaults
+            }
+            return result;
+        }
+
+        function buildS3URI(s3) {
+            if (!s3 || !s3.endpoint || !s3.bucket) {
+                return '';
+            }
+            var path = 's3://' + s3.endpoint.replace(/\/+$/, '') + '/' + s3.bucket.replace(/^\/+|\/+$/g, '');
+            if (s3.prefix) {
+                path += '/' + String(s3.prefix).replace(/^\/+|\/+$/g, '');
+            }
+            var params = [];
+            if (s3.accessKey) {
+                params.push('accessKey=' + encodeURIComponent(s3.accessKey));
+            }
+            if (s3.secretKey) {
+                params.push('secretKey=' + encodeURIComponent(s3.secretKey));
+            }
+            if (s3.useSSL) {
+                params.push('useSSL=true');
+            }
+            if (params.length) {
+                path += '?' + params.join('&');
+            }
+            return path;
+        }
+
+        $scope.s3URIPreview = function () {
+            if (!$scope.currentFolder || !$scope.currentFolder._guiS3) {
+                return '';
+            }
+            return buildS3URI($scope.currentFolder._guiS3);
+        };
+
+        function initS3Editing() {
+            if (!$scope.currentFolder.filesystemType) {
+                $scope.currentFolder.filesystemType = 'basic';
+            }
+            if ($scope.currentFolder.filesystemType === 's3') {
+                $scope.currentFolder._guiS3 = parseS3URI($scope.currentFolder.path || '');
+            } else {
+                $scope.currentFolder._guiS3 = emptyGuiS3();
+            }
+        }
+
+        $scope.setDefaultsForFilesystemType = function () {
+            if (!$scope.currentFolder.filesystemType) {
+                $scope.currentFolder.filesystemType = 'basic';
+            }
+            if ($scope.currentFolder.filesystemType === 's3') {
+                if (!$scope.currentFolder._guiS3) {
+                    $scope.currentFolder._guiS3 = emptyGuiS3();
+                }
+                // Prefer parsing an existing s3:// path when switching type.
+                if (($scope.currentFolder.path || '').indexOf('s3://') === 0) {
+                    $scope.currentFolder._guiS3 = parseS3URI($scope.currentFolder.path);
+                }
+                $scope.currentFolder.fsWatcherEnabled = false;
+                $scope.setFSWatcherIntervalDefault();
+            } else {
+                // Switching back to local: clear a leftover s3 URI so the user
+                // is not left with an invalid local path.
+                if (($scope.currentFolder.path || '').indexOf('s3://') === 0) {
+                    $scope.currentFolder.path = '';
+                }
+            }
+        };
 
         function resetRemoteNeed() {
             $scope.remoteNeed = {};
@@ -2291,6 +2391,9 @@ angular.module('syncthing.core')
             if (!newvalue) {
                 return;
             }
+            if ($scope.currentFolder.filesystemType === 's3') {
+                return;
+            }
             $scope.currentFolder.path = newvalue;
             $http.get(urlbase + '/system/browse', {
                 params: { current: newvalue }
@@ -2321,6 +2424,9 @@ angular.module('syncthing.core')
             var idx;
             if ($scope.currentFolder.type === 'receiveencrypted') {
                 idx = 2;
+            } else if ($scope.currentFolder.filesystemType === 's3') {
+                // No fs watcher on S3 — default to a frequent rescan.
+                idx = 0;
             } else if ($scope.currentFolder.fsWatcherEnabled) {
                 idx = 1;
             } else {
@@ -2334,6 +2440,8 @@ angular.module('syncthing.core')
                 $scope.currentFolder.fsWatcherEnabled = false;
                 $scope.currentFolder.ignorePerms = true;
                 delete $scope.currentFolder.versioning;
+            } else if ($scope.currentFolder.filesystemType === 's3') {
+                $scope.currentFolder.fsWatcherEnabled = false;
             } else {
                 $scope.currentFolder.fsWatcherEnabled = true;
             }
@@ -2364,6 +2472,7 @@ angular.module('syncthing.core')
 
         function editFolderModal(initialTab) {
             initVersioningEditing();
+            initS3Editing();
             $scope.currentFolder._recvEnc = $scope.currentFolder.type === 'receiveencrypted';
             $scope.folderPathErrors = {};
             $scope.folderEditor.$setPristine();
@@ -2433,11 +2542,13 @@ angular.module('syncthing.core')
         }
 
         function editFolder(initialTab) {
-            if ($scope.currentFolder.path.length > 1 && $scope.currentFolder.path.slice(-1) === $scope.system.pathSeparator) {
-                $scope.currentFolder.path = $scope.currentFolder.path.slice(0, -1);
-            } else if (!$scope.currentFolder.path) {
+            if (!$scope.currentFolder.path) {
                 // undefined path leads to invalid input field
                 $scope.currentFolder.path = '';
+            } else if ($scope.currentFolder.filesystemType !== 's3' &&
+                $scope.currentFolder.path.length > 1 &&
+                $scope.currentFolder.path.slice(-1) === $scope.system.pathSeparator) {
+                $scope.currentFolder.path = $scope.currentFolder.path.slice(0, -1);
             }
             initShareEditing('folder');
             editFolderModal(initialTab);
@@ -2640,6 +2751,16 @@ angular.module('syncthing.core')
             }
             folderCfg.devices = newDevices;
             delete $scope.currentSharing;
+
+            // Apply S3 filesystem settings into path + filesystemType.
+            if (!folderCfg.filesystemType) {
+                folderCfg.filesystemType = 'basic';
+            }
+            if (folderCfg.filesystemType === 's3') {
+                folderCfg.path = buildS3URI(folderCfg._guiS3);
+                folderCfg.fsWatcherEnabled = false;
+            }
+            delete folderCfg._guiS3;
 
             if (!folderCfg.versioning) {
                 folderCfg.versioning = {params: {}};
