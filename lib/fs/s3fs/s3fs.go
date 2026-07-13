@@ -393,52 +393,78 @@ func (f *S3Filesystem) OpenFile(name string, flags int, mode fs.FileMode) (fs.Fi
 		return nil, err
 	}
 
+	// Spill object content to a local temp file so large objects do not need
+	// to sit entirely in process RAM (ReadAt/WriteAt/Seek still work).
+	tmp, err := os.CreateTemp("", "syncthing-s3-*")
+	if err != nil {
+		return nil, fmt.Errorf("s3fs: create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
 	sf := &s3File{
-		fs:    f,
-		name:  name,
-		key:   k,
-		flags: flags,
-		mode:  mode,
+		fs:      f,
+		name:    name,
+		key:     k,
+		flags:   flags,
+		mode:    mode,
+		tmp:     tmp,
+		tmpPath: tmpPath,
 	}
 
-	if flags&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0 {
-		// Writable mode – we buffer in memory.
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+
+	writable := flags&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0
+
+	if writable {
 		if flags&os.O_TRUNC != 0 || flags&os.O_CREATE != 0 {
-			// Either truncating or creating: start with empty content.
 			obj, statErr := f.client.StatObject(context.Background(), f.bucket, k, minio.StatObjectOptions{})
 			if statErr == nil {
-				// Object exists – preserve its metadata.
 				sf.meta = obj.UserMetadata
 			}
 			if flags&os.O_EXCL != 0 && statErr == nil {
+				cleanup()
 				return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrExist}
 			}
 			if flags&os.O_TRUNC != 0 {
-				sf.buf = &bytes.Buffer{}
+				// Empty local file; must upload even if never written.
+				sf.dirty = true
 			} else if statErr == nil {
-				// Object exists and not truncating: load existing content.
-				if err := sf.loadContent(); err != nil {
+				if err := sf.downloadToTemp(); err != nil {
+					cleanup()
 					return nil, err
 				}
 			} else {
-				sf.buf = &bytes.Buffer{}
+				// New object.
+				sf.dirty = true
 			}
 		} else {
-			// No truncate, no create; object must exist.
-			if err := sf.loadContent(); err != nil {
+			// Writable without create/trunc: object must already exist.
+			if err := sf.downloadToTemp(); err != nil {
+				cleanup()
 				return nil, err
 			}
 		}
-		sf.dirty = true
 	} else {
-		// Read-only mode.
-		if err := sf.loadContent(); err != nil {
+		// Read-only.
+		if err := sf.downloadToTemp(); err != nil {
+			cleanup()
 			return nil, err
 		}
 	}
 
 	if flags&os.O_APPEND != 0 {
-		sf.offset = int64(sf.buf.Len())
+		if _, err := sf.tmp.Seek(0, io.SeekEnd); err != nil {
+			cleanup()
+			return nil, err
+		}
+	} else {
+		if _, err := sf.tmp.Seek(0, io.SeekStart); err != nil {
+			cleanup()
+			return nil, err
+		}
 	}
 
 	return sf, nil
@@ -867,24 +893,26 @@ func (fi *s3FileInfo) Group() int          { return fi.gid }
 
 // ── s3File ──
 
-// s3File implements fs.File. It buffers the entire object content in memory for
-// read/write operations, and flushes to S3 on Close() if the file was opened for
-// writing.
+// s3File implements fs.File using a local temporary file as the backing store.
+// Object content is streamed from S3 into the temp file on open (when needed)
+// and streamed back with PutObject on flush/close if dirty. This keeps peak
+// memory use low for large objects while still supporting Seek/ReadAt/WriteAt.
 type s3File struct {
-	fs     *S3Filesystem
-	name   string
-	key    string
-	flags  int
-	mode   fs.FileMode
-	buf    *bytes.Buffer
-	offset int64
-	dirty  bool
-	closed bool
-	mu     sync.Mutex
-	meta   map[string]string
+	fs      *S3Filesystem
+	name    string
+	key     string
+	flags   int
+	mode    fs.FileMode
+	tmp     *os.File
+	tmpPath string
+	dirty   bool
+	closed  bool
+	mu      sync.Mutex
+	meta    map[string]string
 }
 
-func (f *s3File) loadContent() error {
+// downloadToTemp streams the S3 object into the temp file and captures metadata.
+func (f *s3File) downloadToTemp() error {
 	ctx := context.Background()
 	obj, err := f.fs.client.GetObject(ctx, f.fs.bucket, f.key, minio.GetObjectOptions{})
 	if err != nil {
@@ -897,11 +925,18 @@ func (f *s3File) loadContent() error {
 		return &os.PathError{Op: "open", Path: f.name, Err: os.ErrNotExist}
 	}
 
-	data, err := io.ReadAll(obj)
-	if err != nil {
+	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	f.buf = bytes.NewBuffer(data)
+	if err := f.tmp.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := io.Copy(f.tmp, obj); err != nil {
+		return err
+	}
+	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	f.meta = info.UserMetadata
 	return nil
 }
@@ -912,16 +947,7 @@ func (f *s3File) Read(p []byte) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
-	data := f.buf.Bytes()
-	if f.offset >= int64(len(data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, data[f.offset:])
-	f.offset += int64(n)
-	if n == 0 {
-		return 0, io.EOF
-	}
-	return n, nil
+	return f.tmp.Read(p)
 }
 
 func (f *s3File) ReadAt(p []byte, off int64) (int, error) {
@@ -930,15 +956,7 @@ func (f *s3File) ReadAt(p []byte, off int64) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
-	data := f.buf.Bytes()
-	if off >= int64(len(data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, data[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
+	return f.tmp.ReadAt(p, off)
 }
 
 func (f *s3File) Write(p []byte) (int, error) {
@@ -947,23 +965,11 @@ func (f *s3File) Write(p []byte) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
-	data := f.buf.Bytes()
-	// Extend buffer if necessary
-	if f.offset > int64(len(data)) {
-		padding := make([]byte, f.offset-int64(len(data)))
-		data = append(data, padding...)
+	n, err := f.tmp.Write(p)
+	if n > 0 {
+		f.dirty = true
 	}
-	// Write at current offset
-	end := f.offset + int64(len(p))
-	if end > int64(len(data)) {
-		data = append(data[:f.offset], p...)
-	} else {
-		copy(data[f.offset:], p)
-	}
-	f.buf = bytes.NewBuffer(data)
-	f.offset = end
-	f.dirty = true
-	return len(p), nil
+	return n, err
 }
 
 func (f *s3File) WriteAt(p []byte, off int64) (int, error) {
@@ -972,17 +978,11 @@ func (f *s3File) WriteAt(p []byte, off int64) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
-	data := f.buf.Bytes()
-	end := off + int64(len(p))
-	if end > int64(len(data)) {
-		extended := make([]byte, end)
-		copy(extended, data)
-		data = extended
+	n, err := f.tmp.WriteAt(p, off)
+	if n > 0 {
+		f.dirty = true
 	}
-	copy(data[off:], p)
-	f.buf = bytes.NewBuffer(data)
-	f.dirty = true
-	return len(p), nil
+	return n, err
 }
 
 func (f *s3File) Seek(offset int64, whence int) (int64, error) {
@@ -991,18 +991,7 @@ func (f *s3File) Seek(offset int64, whence int) (int64, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
-	switch whence {
-	case io.SeekStart:
-		f.offset = offset
-	case io.SeekCurrent:
-		f.offset += offset
-	case io.SeekEnd:
-		f.offset = int64(f.buf.Len()) + offset
-	}
-	if f.offset < 0 {
-		f.offset = 0
-	}
-	return f.offset, nil
+	return f.tmp.Seek(offset, whence)
 }
 
 func (f *s3File) Close() error {
@@ -1013,26 +1002,45 @@ func (f *s3File) Close() error {
 	}
 	f.closed = true
 
+	var flushErr error
 	if f.dirty && f.flags&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0 {
-		return f.flush()
+		flushErr = f.flushLocked()
 	}
-	return nil
+
+	// Always release the temp file.
+	_ = f.tmp.Close()
+	_ = os.Remove(f.tmpPath)
+	f.tmp = nil
+	return flushErr
 }
 
-func (f *s3File) flush() error {
-	data := f.buf.Bytes()
+// flushLocked uploads the temp file to S3. Caller must hold f.mu.
+func (f *s3File) flushLocked() error {
 	meta := f.meta
 	if meta == nil {
 		meta = defaultMeta(f.mode)
 	}
-	// Update mtime on write
 	meta[metaKeyMtime] = time.Now().Format(time.RFC3339Nano)
 
-	_, err := f.fs.client.PutObject(context.Background(), f.fs.bucket, f.key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
+	fi, err := f.tmp.Stat()
+	if err != nil {
+		return err
+	}
+	size := fi.Size()
+	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	// Stream from disk; minio-go will multipart large objects as needed.
+	_, err = f.fs.client.PutObject(context.Background(), f.fs.bucket, f.key, f.tmp, size, minio.PutObjectOptions{
 		UserMetadata: meta,
 	})
+	if err != nil {
+		return err
+	}
+	f.dirty = false
 	f.fs.tree.invalidate()
-	return err
+	return nil
 }
 
 func (f *s3File) Name() string {
@@ -1045,15 +1053,10 @@ func (f *s3File) Truncate(size int64) error {
 	if f.closed {
 		return os.ErrClosed
 	}
-	data := f.buf.Bytes()
-	if size < int64(len(data)) {
-		data = data[:size]
-	} else {
-		extended := make([]byte, size)
-		copy(extended, data)
-		data = extended
+	if err := f.tmp.Truncate(size); err != nil {
+		return err
 	}
-	f.buf = bytes.NewBuffer(data)
+	// Match os.File: truncation does not move the offset by itself.
 	f.dirty = true
 	return nil
 }
@@ -1061,12 +1064,19 @@ func (f *s3File) Truncate(size int64) error {
 func (f *s3File) Stat() (fs.FileInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		return nil, os.ErrClosed
+	}
 
 	meta := f.meta
 	if meta == nil {
 		meta = defaultMeta(f.mode)
 	}
-	return newS3FileInfo(f.name, int64(f.buf.Len()), meta, time.Now()), nil
+	fi, err := f.tmp.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return newS3FileInfo(f.name, fi.Size(), meta, fi.ModTime()), nil
 }
 
 func (f *s3File) Sync() error {
@@ -1075,8 +1085,11 @@ func (f *s3File) Sync() error {
 	if f.closed {
 		return os.ErrClosed
 	}
+	if err := f.tmp.Sync(); err != nil {
+		return err
+	}
 	if f.dirty {
-		return f.flush()
+		return f.flushLocked()
 	}
 	return nil
 }

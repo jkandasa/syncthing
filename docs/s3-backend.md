@@ -309,7 +309,10 @@ lists. `HeadObject` is largely avoided for walk/stat when the cache is warm.
 ## Limitations
 
 1. **No filesystem watching** — S3 does not support inotify-style notifications, so `fsWatcherEnabled` should be set to `false`. Use periodic rescans instead.
-2. **In-memory file buffering** — files are buffered entirely in memory during read/write operations. Very large files may consume significant memory.
+2. **Local temp files for open objects** — each open file is backed by a temporary
+   file under the process temp directory (streamed from/to S3). Peak RAM stays
+   low for large objects, but you need free local disk roughly equal to the size
+   of concurrently open files.
 3. **No extended attributes (xattrs)** — S3 does not natively support xattrs. The backend returns `ErrXattrsNotSupported`.
 4. **Eventual consistency** — depending on the S3 provider, recently written objects may not be immediately visible.
 5. **No hard links** — S3 objects are independent; hard links are not supported.
